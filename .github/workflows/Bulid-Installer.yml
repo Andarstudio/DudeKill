@@ -1,0 +1,110 @@
+name: MediaFire to EXE Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+env:
+  MEDIAFIRE_URL: https://www.mediafire.com/file/01drzjt1v9us0d3/source.zip/file
+  APP_NAME: Unity Hub
+  APP_VERSION: 1.0.0
+  APP_PUBLISHER: Unity LLC
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download zip from MediaFire
+        shell: pwsh
+        run: |
+          $page = (Invoke-WebRequest -Uri $env:MEDIAFIRE_URL -UseBasicParsing).Content
+          $m = [regex]::Match($page, 'https://download[^"''\s]+mediafire\.com/[^"''\s]+')
+          if (-not $m.Success) { throw "Could not find the direct download link on the MediaFire page" }
+          Invoke-WebRequest -Uri $m.Value -OutFile source.zip
+          $hdr = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("source.zip")[0..1])
+          if ($hdr -ne "PK") { throw "Downloaded file is not a zip (link may be private, expired or blocked)" }
+
+      - name: Extract zip
+        shell: pwsh
+        run: |
+          Expand-Archive -Path source.zip -DestinationPath extracted -Force
+          Get-ChildItem extracted -Recurse | Select-Object FullName
+
+      - name: Locate MSIX
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force payload | Out-Null
+          $pkg = Get-ChildItem extracted -Recurse -Include *.msix,*.msixbundle,*.appx,*.appxbundle | Select-Object -First 1
+          $name = $null
+          if ($pkg) {
+            $name = $pkg.Name
+          } else {
+            foreach ($f in Get-ChildItem extracted -Recurse -Filter *.exe) {
+              $hdr = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($f.FullName)[0..1])
+              if ($hdr -eq "PK") { $pkg = $f; $name = [IO.Path]::ChangeExtension($f.Name, ".msix"); break }
+            }
+          }
+          if (-not $pkg) { throw "No MSIX found in the zip" }
+          Copy-Item $pkg.FullName "payload\$name"
+          "MSIX_NAME=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $cer = Get-ChildItem extracted -Recurse -Filter *.cer | Select-Object -First 1
+          if ($cer) {
+            Copy-Item $cer.FullName "payload\$($cer.Name)"
+            "CER_NAME=$($cer.Name)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Create installer script
+        shell: pwsh
+        run: |
+          $msix = $env:MSIX_NAME
+          $cer  = $env:CER_NAME
+          $files = "Source: ""$env:GITHUB_WORKSPACE\payload\$msix""; DestDir: ""{app}""; Flags: ignoreversion"
+          $run = ""
+          if ($cer) {
+            $files += "`nSource: ""$env:GITHUB_WORKSPACE\payload\$cer""; DestDir: ""{app}""; Flags: ignoreversion"
+            $run += "Filename: ""certutil.exe""; Parameters: ""-addstore TrustedPeople """"{app}\$cer""""""; StatusMsg: ""Trusting package certificate...""; Flags: runhidden waituntilterminated`n"
+          }
+          $run += "Filename: ""powershell.exe""; Parameters: ""-NoProfile -ExecutionPolicy Bypass -Command """"Add-AppxPackage -Path '{app}\$msix'""""""; StatusMsg: ""Installing $env:APP_NAME...""; Flags: runhidden waituntilterminated"
+
+          $iss = @"
+          [Setup]
+          AppName=$env:APP_NAME
+          AppVersion=$env:APP_VERSION
+          AppPublisher=$env:APP_PUBLISHER
+          DefaultDirName={autopf}\$env:APP_NAME
+          OutputDir=$env:GITHUB_WORKSPACE\installer
+          OutputBaseFilename=$env:APP_NAME-Setup-$env:APP_VERSION
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64compatible
+          PrivilegesRequired=admin
+          WizardStyle=modern
+          DisableWelcomePage=no
+          DisableDirPage=no
+          DisableProgramGroupPage=yes
+          DisableReadyPage=yes
+          DisableFinishedPage=no
+
+          [Files]
+          $files
+
+          [Run]
+          $run
+          "@
+          Set-Content -Path installer.iss -Value $iss -Encoding UTF8
+
+      - name: Build installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: installer/*.exe
