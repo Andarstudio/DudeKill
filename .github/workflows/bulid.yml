@@ -1,0 +1,134 @@
+name: MediaFire to EXE Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+env:
+  MEDIAFIRE_URL: https://www.mediafire.com/file/01drzjt1v9us0d3/source.zip/file
+  APP_NAME: MyApp
+  APP_VERSION: 1.0.0
+  APP_PUBLISHER: YourName
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download zip from MediaFire
+        shell: pwsh
+        run: |
+          $page = (Invoke-WebRequest -Uri $env:MEDIAFIRE_URL -UseBasicParsing).Content
+          $m = [regex]::Match($page, 'https://download[^"''\s]+mediafire\.com/[^"''\s]+')
+          if (-not $m.Success) { throw "Could not find the direct download link on the MediaFire page" }
+          Write-Host "Direct link found"
+          Invoke-WebRequest -Uri $m.Value -OutFile source.zip
+
+          # Make sure we got a real zip, not an HTML error page
+          $hdr = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("source.zip")[0..1])
+          if ($hdr -ne "PK") { throw "Downloaded file is not a zip (link may be private, expired or blocked)" }
+
+      - name: Extract zip
+        shell: pwsh
+        run: |
+          Expand-Archive -Path source.zip -DestinationPath extracted -Force
+          Get-ChildItem extracted -Recurse | Select-Object FullName
+
+      - name: Locate MSIX (and optional certificate)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force payload | Out-Null
+
+          $pkg = Get-ChildItem extracted -Recurse -Include *.msix,*.msixbundle,*.appx,*.appxbundle |
+                 Select-Object -First 1
+          $name = $null
+
+          if ($pkg) {
+            $name = $pkg.Name
+          } else {
+            # Fallback: an .exe that is really a renamed MSIX
+            foreach ($f in Get-ChildItem extracted -Recurse -Filter *.exe) {
+              $bytes = [System.IO.File]::ReadAllBytes($f.FullName)[0..1]
+              $hdr = [System.Text.Encoding]::ASCII.GetString($bytes)
+              if ($hdr -eq "PK") { $pkg = $f; $name = [IO.Path]::ChangeExtension($f.Name, ".msix"); break }
+              else { Write-Host "$($f.Name) is a real .exe (MZ header), skipping" }
+            }
+          }
+
+          if (-not $pkg) { throw "No MSIX found in the zip" }
+          Copy-Item $pkg.FullName "payload\$name"
+          "MSIX_NAME=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+          # Optional: a .cer in the zip lets Windows trust a self-signed package
+          $cer = Get-ChildItem extracted -Recurse -Filter *.cer | Select-Object -First 1
+          if ($cer) {
+            Copy-Item $cer.FullName "payload\$($cer.Name)"
+            "CER_NAME=$($cer.Name)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Create installer script
+        shell: pwsh
+        run: |
+          $msix = $env:MSIX_NAME
+          $cer  = $env:CER_NAME
+
+          $files = "Source: ""$env:GITHUB_WORKSPACE\payload\$msix""; DestDir: ""{app}""; Flags: ignoreversion"
+          $run = ""
+
+          if ($cer) {
+            $files += "`nSource: ""$env:GITHUB_WORKSPACE\payload\$cer""; DestDir: ""{app}""; Flags: ignoreversion"
+            $run += "Filename: ""certutil.exe""; Parameters: ""-addstore TrustedPeople """"{app}\$cer""""""; StatusMsg: ""Trusting package certificate...""; Flags: runhidden waituntilterminated`n"
+          }
+
+          $run += "Filename: ""powershell.exe""; Parameters: ""-NoProfile -ExecutionPolicy Bypass -Command """"Add-AppxPackage -Path '{app}\$msix'""""""; StatusMsg: ""Installing $env:APP_NAME...""; Flags: runhidden waituntilterminated"
+
+          $iss = @"
+          [Setup]
+          AppName=$env:APP_NAME
+          AppVersion=$env:APP_VERSION
+          AppPublisher=$env:APP_PUBLISHER
+          DefaultDirName={autopf}\$env:APP_NAME
+          OutputDir=$env:GITHUB_WORKSPACE\installer
+          OutputBaseFilename=$env:APP_NAME-Setup-$env:APP_VERSION
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64compatible
+          PrivilegesRequired=admin
+          WizardStyle=modern
+          DisableWelcomePage=no
+          DisableDirPage=no
+          DisableProgramGroupPage=yes
+          DisableReadyPage=yes
+          DisableFinishedPage=no
+
+          [Files]
+          $files
+
+          [Run]
+          $run
+          "@
+          Set-Content -Path installer.iss -Value $iss -Encoding UTF8
+          Get-Content installer.iss
+
+      - name: Build installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: installer/*.exe
+
+      - name: Attach to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
